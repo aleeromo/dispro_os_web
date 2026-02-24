@@ -487,31 +487,26 @@ def calcular_flete(destino: str):
     
     return {"distancia": round(dist_km), "tiempo": round(time_h, 1), "total": total_flete, "desglose": f"Gasolina: ${gas:.0f} | Casetas: ${casetas:.0f} | Viáticos: ${viaticos:.0f} | Hospedaje: ${hospedaje:.0f}"}
 
-def _resolve_modo_final(modo_from_ocr: str, cajas: list, reader_available: bool) -> str:
+def _resolve_modo_final(cajas: list, reader_available: bool, ocr_found_measures: bool) -> str:
     """
-    Punto único de decisión modo 3D vs ROLLO (detección/clasificación).
-    Orden y condiciones:
-    1. Sin masters → ROLLO (salvo que OCR haya dicho 3D y no tengamos formas; entonces 3D).
-    2. Varias piezas raíz o una con huecos (childrenIds) → 3D (letras/cajas).
-    3. Sin OCR: una forma detectada → 3D por defecto.
-    4. Una sola pieza raíz con OCR: si cobertura >= 0.80 (ocupa casi toda la imagen) → ROLLO
-       aunque haya medidas en la imagen (formato de rollo con cotas). Si cobertura < 0.80 → 3D.
-    5. Resto: modo_from_ocr.
+    Punto único de decisión modo 3D vs ROLLO. Por defecto 3D (Letras 3D) para no detectar
+    al instante como "imagen para impresión". ROLLO solo con evidencia clara:
+    - Una sola pieza raíz que ocupa casi toda la imagen (cobertura >= 0.80) Y
+    - OCR encontró cotas/medidas en la imagen (número + unidad: m, cm, mm).
     """
     masters = [s for s in cajas if s.get("is_master")]
     if not masters:
-        return "ROLLO" if modo_from_ocr != "3D" else "3D"
+        return "3D"
     if len(masters) > 1 or (masters[0].get("childrenIds")):
         return "3D"
     if not reader_available:
         return "3D"
     if len(masters) == 1:
         cov = masters[0].get("norm_w", 0) * masters[0].get("norm_h", 0)
-        if cov >= 0.80:
+        if cov >= 0.80 and ocr_found_measures:
             return "ROLLO"
-        if cov < 0.80:
-            return "3D"
-    return modo_from_ocr
+        return "3D"
+    return "3D"
 
 
 @app.get('/api/v1/health')
@@ -560,7 +555,8 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                 status_code=400,
                 detail=_error_body("INVALID_FILE", f"Dimensiones mínimas {MIN_IMAGE_WIDTH_PX}x{MIN_IMAGE_HEIGHT_PX} px.", {"w_px": w_px, "h_px": h_px}),
             )
-        modo_detectado = 'ROLLO'
+        modo_detectado = '3D'
+        ocr_found_measures = False
         wm, hm = 1.0, 1.0
         cajas = []
         exclusion_zones = []
@@ -583,8 +579,6 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                 txt_h = ""
                 for (bbox, text, prob) in res_ocr:
                     txt_h += f" {text.lower()} "
-                    if re.search(r'\d', text):
-                        modo_detectado = '3D'  
                     if _REGEX_COTA.search(text.strip()):  
                         pts = np.array(bbox, dtype=np.float32) / scale_ocr
                         exclusion_zones.append((float(np.min(pts[:,0]))-15.0, float(np.min(pts[:,1]))-15.0,
@@ -598,8 +592,6 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                 txt_v = ""
                 for (bbox, text, prob) in res_ocr_rot:
                     txt_v += f" {text.lower()} "
-                    if re.search(r'\d', text):
-                        modo_detectado = '3D'
                     if _REGEX_COTA.search(text.strip()):
                         pts_r = np.array(bbox, dtype=np.float32)
                         orig_x = pts_r[:, 1] / scale_ocr
@@ -615,8 +607,6 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                 txt_v_ccw = ""
                 for (bbox, text, prob) in res_ocr_rot_ccw:
                     txt_v_ccw += f" {text.lower()} "
-                    if re.search(r'\d', text):
-                        modo_detectado = '3D'
                     if _REGEX_COTA.search(text.strip()):
                         pts_r = np.array(bbox, dtype=np.float32)
                         orig_x = (rot_h_px_ccw - pts_r[:, 1]) / scale_ocr
@@ -631,13 +621,11 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                 v_meds_s = sorted(list(set(v_meds)), reverse=True)
                 wm = h_meds_s[0] if h_meds_s else (all_meds[0] if all_meds else 1.0)
                 hm = v_meds_s[0] if v_meds_s else (all_meds[1] if len(all_meds) > 1 else wm * (float(h_px) / float(w_px)))
-                # Si hay medidas extraídas (número + unidad) o texto tipo cota en la imagen → Letras 3D (tu método: medidas en la imagen)
-                if h_meds or v_meds:
-                    modo_detectado = '3D'
-                else:
+                ocr_found_measures = bool(h_meds or v_meds)
+                if not ocr_found_measures:
                     for combined in (txt_h, txt_v, txt_v_ccw):
                         if _REGEX_COTA.search(combined):
-                            modo_detectado = '3D'
+                            ocr_found_measures = True
                             break
             except Exception as e:
                 print(f"[ERROR OCR] preprocesar_imagen: {e}", flush=True)
@@ -671,7 +659,7 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                     if masters_alt:
                         cajas = cajas_alt
                         masters = masters_alt
-                modo_detectado = _resolve_modo_final(modo_detectado, cajas, READER is not None)
+                modo_detectado = _resolve_modo_final(cajas, READER is not None, ocr_found_measures)
             except HTTPException:
                 raise
             except Exception as e:
