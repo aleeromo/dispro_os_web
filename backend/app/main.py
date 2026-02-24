@@ -133,6 +133,66 @@ def _job_store_set(job_id: str, shapes: Dict[int, np.ndarray], meta: dict, ancho
         _JOB_STORE.pop(oldest, None)
 
 
+def _job_store_update_nesting(job_id: str, svg_str: str, folio: str):
+    """Actualiza el job con el SVG de nesting (vectores CNC) y folio para descarga. Fase 2."""
+    if job_id not in _JOB_STORE:
+        return
+    _JOB_STORE[job_id]["last_nesting_svg"] = svg_str
+    _JOB_STORE[job_id]["last_folio"] = folio
+
+
+def _build_nesting_svg(geometria_nesting: list, sheet_w: float, sheet_h: float, gap: float) -> str:
+    """Construye el SVG de nesting (vista por placas) para export CNC. Misma lógica que frontend PlanosTab."""
+    if not geometria_nesting:
+        return ""
+    placas_arr = [int(g.get("placa", 0)) for g in geometria_nesting if isinstance(g.get("placa"), (int, float))]
+    num_placas = max(1, max(placas_arr) + 1) if placas_arr else 1
+    step_y = sheet_h + gap
+    view_w = sheet_w + 0.2
+    view_h = sheet_h * num_placas + gap * (num_placas - 1) + 0.2
+    parts = [f'<svg viewBox="-0.1 -0.1 {view_w:.4f} {view_h:.4f}" xmlns="http://www.w3.org/2000/svg">']
+    by_placa = {}
+    for g in geometria_nesting:
+        pi = min(num_placas - 1, max(0, int(g.get("placa", 0))))
+        if pi not in by_placa:
+            by_placa[pi] = []
+        by_placa[pi].append(g)
+    for i in range(num_placas):
+        off_y = i * step_y
+        parts.append(f'<g transform="translate(0, {off_y:.4f})">')
+        parts.append(f'<rect x="0" y="0" width="{sheet_w:.4f}" height="{sheet_h:.4f}" fill="none" stroke="#000" stroke-width="0.008"/>')
+        for geo in by_placa.get(i, []):
+            puntos = geo.get("puntos") or []
+            path_d = (geo.get("svg_path_d") or "").strip()
+            gx = float(geo.get("global_x", 0))
+            gy = float(geo.get("global_y", 0))
+            wg = float(geo.get("w_m", 0.1))
+            hg = float(geo.get("h_m", 0.1))
+            if geo.get("tipo") == "canto":
+                if puntos and len(puntos) >= 3:
+                    pts_str = " ".join(f"{p.get('x', 0):.4f},{p.get('y', 0):.4f}" for p in puntos)
+                    parts.append(f'<polygon points="{pts_str}" fill="rgba(59,130,246,0.2)" stroke="#3b82f6" stroke-width="0.01"/>')
+                elif path_d:
+                    parts.append(f'<path d="{path_d}" fill="none" stroke="#3b82f6" stroke-width="0.01"/>')
+            else:
+                if puntos and len(puntos) >= 3:
+                    pts_str = " ".join(f"{p.get('x', 0):.4f},{p.get('y', 0):.4f}" for p in puntos)
+                    parts.append(f'<polygon points="{pts_str}" fill="none" stroke="#000" stroke-width="0.005"/>')
+                elif path_d:
+                    parts.append(f'<path d="{path_d}" fill="none" stroke="#000" stroke-width="0.005"/>')
+                else:
+                    parts.append(f'<rect x="{gx:.4f}" y="{gy:.4f}" width="{wg:.4f}" height="{hg:.4f}" fill="none" stroke="#666" stroke-width="0.004"/>')
+            for v in geo.get("vinilos") or []:
+                vpts = v.get("puntos") or []
+                if len(vpts) >= 3:
+                    pts_str = " ".join(f"{p.get('x', 0):.4f},{p.get('y', 0):.4f}" for p in vpts)
+                    col = v.get("color", "#fff")
+                    parts.append(f'<polygon points="{pts_str}" fill="{col}" opacity="0.9"/>')
+        parts.append("</g>")
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
 def _error_body(code: str, message: str, details: Optional[dict] = None) -> dict:
     """Esquema común de error: code, message, details (opcional)."""
     out = {"code": code, "message": message}
@@ -639,6 +699,28 @@ async def generate_svg(request: Request, req: GenerateSvgRequest, x_job_id: Opti
     except Exception as e:
         raise HTTPException(status_code=500, detail=_error_body("SERVER_ERROR", str(e)))
 
+
+@app.get('/api/v1/vectores-cnc')
+async def vectores_cnc(request: Request, x_job_id: Optional[str] = Header(None, alias="X-Job-Id")):
+    """Fase 2: devuelve el SVG de nesting (vectores para corte CNC) del job. Requiere job id (header X-Job-Id o query job_id)."""
+    job_id = _get_job_id_from_request(request)
+    if not job_id:
+        raise HTTPException(status_code=400, detail=_error_body("JOB_ID_REQUIRED", "Se requiere job_id (header X-Job-Id o query job_id)."))
+    job = _job_store_get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=_error_body("JOB_NOT_FOUND", "La sesión expiró o no es válida. Carga de nuevo la imagen."))
+    svg_str = job.get("last_nesting_svg")
+    if not svg_str:
+        raise HTTPException(status_code=404, detail=_error_body("NO_VECTORES", "No hay vectores CNC para este job. Analiza primero en modo 3D."))
+    folio = job.get("last_folio") or "Vectores_Corte"
+    filename = f"{folio}_Vectores_Corte.svg"
+    return Response(
+        content=svg_str,
+        media_type="image/svg+xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 def _limpiar_y_procesar_imagen_3d(img_cv: np.ndarray, exclusion_zones: list) -> str:
     import base64
     import io as _io
@@ -918,6 +1000,10 @@ async def analizar_proyecto(
         texto_formal = f"Letras 3D|SPLIT|Suministro y colocación* de:\n\nCaja de luz fabricada en {mat_desc}, relieve de {int(float(prof_canto)*100)} cms.\nTapas traseras en PVC de 3mm.\n{'Iluminada con módulos led y fuentes de poder.' if is_con_luz else 'Sin iluminación.'}\n\nMedidas finales: {float(ancho_m):.2f}m x {float(alto_m):.2f}m."
         geo_orig = list(geo_o) if (cnts_list and len(cnts_list) > 0) else []
         colores_dom = list(dict.fromkeys([p.get("color", "") for p in geo_orig if p.get("color")]))
+        # Fase 2: guardar SVG de nesting en el job para descarga vectores CNC desde backend
+        nesting_svg = _build_nesting_svg(list(geo_n), 3.05 if "aluminio" in str(material_cara).lower() else 2.4, 0.9 if "aluminio" in str(material_cara).lower() else 1.2, 0.3)
+        if nesting_svg:
+            _job_store_update_nesting(job_id, nesting_svg, f"PRO-{folio_id}")
         return CotizacionResponse(
             modo=str(modo), ancho_m=float(ancho_m), alto_m=float(alto_m),
             total_venta=total_venta, desglose_texto=texto_formal, desglose_tecnico=desglose,

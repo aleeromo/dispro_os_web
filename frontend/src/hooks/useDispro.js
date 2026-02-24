@@ -134,10 +134,10 @@ export function useDispro() {
     analisis.resetEstudio?.();
   }, [appCtx, analisis]);
 
-  // Wrapper: descargar SVG CNC usando folio actual del PDF
+  // Wrapper: descargar vectores CNC desde backend (Fase 2) o fallback DOM
   const descargarVectoresCNC = useCallback(() => {
-    descargarVectoresCNCUtil(pdf.pdfFolio);
-  }, [pdf.pdfFolio]);
+    descargarVectoresCNCUtil(pdf.pdfFolio, analisis.jobId, analisis.setErrorMsg);
+  }, [pdf.pdfFolio, analisis.jobId, analisis.setErrorMsg]);
 
   return {
     // AppContext
