@@ -35,14 +35,16 @@ function ShapeMesh({ s, imageWidth, imageHeight, texture, lightsOn }) {
   const bevelSize = useMeters ? 0.0004 : 0.4;
   const matDef = MATERIAL_BASE[isImpreso ? 'acrilico' : s.mat] || MATERIAL_BASE.acrilico;
 
-  const curveSegments = 128;
+  // Motor Render: curveSegments 96 cuando px; bevel 0.4 / 4 segments en Motor
+  const curveSegments = useMeters ? 128 : 96;
+  const bevelSegments = 4;
   const geometry = useMemo(() => {
     const geo = new THREE.ExtrudeGeometry(s.shape, {
       depth,
       bevelEnabled: !isVinil,
       bevelThickness,
       bevelSize,
-      bevelSegments: 5,
+      bevelSegments,
       curveSegments,
     });
     // UV impreso: igual que Smart Render — aplicar a TODOS los vértices: u = x/imageWidth, v = 1 - y/imageHeight.
@@ -59,7 +61,7 @@ function ShapeMesh({ s, imageWidth, imageHeight, texture, lightsOn }) {
       uv.needsUpdate = true;
     }
     return geo;
-  }, [s.shape, depth, isVinil, isImpreso, imageWidth, imageHeight, bevelThickness, bevelSize]);
+  }, [s.shape, depth, isVinil, isImpreso, imageWidth, imageHeight, bevelThickness, bevelSize, curveSegments, bevelSegments]);
 
   const mainMaterial = useMemo(
     () => {
@@ -110,6 +112,7 @@ function ShapeMesh({ s, imageWidth, imageHeight, texture, lightsOn }) {
         castShadow
         receiveShadow
       />
+      {/* Motor: position [0,0,zPos-1], distance 15, intensity 2.5, decay 2 (en px; en m usar offset proporcional) */}
       {isAluminio && lightsOn && (
         <pointLight
           color="#ffffff"
@@ -250,9 +253,10 @@ export function Render3DCanvas({
         />
         <EffectComposer multisampling={0}>
           <SMAA preset={SMAA.PRESET_HIGH} />
+          {/* Motor: intensity 1.0, threshold 0.85 cuando lightsOn */}
           <Bloom
-            intensity={lightsOn ? 0.6 : 0}
-            luminanceThreshold={0.92}
+            intensity={lightsOn ? 1.0 : 0}
+            luminanceThreshold={0.85}
             luminanceSmoothing={0.9}
             mipmapBlur
           />

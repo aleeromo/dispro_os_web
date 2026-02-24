@@ -300,23 +300,28 @@ def _detect_shapes_smart_render(
     gray_threshold: int = 200,
     out_shapes: Optional[Dict[int, np.ndarray]] = None,
     out_meta: Optional[dict] = None,
+    motor_style: bool = True,
 ) -> list:
-    """Detección para nesting: umbral por defecto 200, RETR_TREE (contornos externos + interiores/huecos).
-    Escribe en out_shapes (id → contorno) y out_meta (w_px, h_px, hierarchy). Si no se pasan, no guarda (solo devuelve shapes).
-    gray_threshold: umbral para imágenes sin alpha; más bajo (p. ej. 128) detecta más formas suaves/texto."""
+    """Detección para nesting. motor_style=True (alineado con Motor Render): gray, threshold 240 INV,
+    filtro bbox solo w<2/h<2/w>w_img*0.99, is_master por contención X+esquina superior (no extent Y).
+    motor_style=False: umbral configurable, alpha→blanco si hay canal alpha, jerarquía OpenCV para is_master."""
     if out_shapes is not None:
         out_shapes.clear()
     if out_meta is not None:
         out_meta.clear()
     exclusion_zones = exclusion_zones or []
     h_img, w_img = img.shape[:2]
-    # Máscara binaria: si hay alpha (PNG con transparencia), usarla para preservar huecos (transparente = fondo)
-    if len(img.shape) == 3 and img.shape[2] == 4:
-        alpha = img[:, :, 3]
-        binary = (alpha >= 128).astype(np.uint8) * 255  # opaco = figura (255), transparente = hueco/fondo (0)
-    else:
+    # Binarización: Motor = gray + threshold 240 INV; modo legacy = alpha o gray+threshold
+    if motor_style:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-        _, binary = cv2.threshold(gray, gray_threshold, 255, cv2.THRESH_BINARY_INV)
+        _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    else:
+        if len(img.shape) == 3 and img.shape[2] == 4:
+            alpha = img[:, :, 3]
+            binary = (alpha >= 128).astype(np.uint8) * 255
+        else:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+            _, binary = cv2.threshold(gray, gray_threshold, 255, cv2.THRESH_BINARY_INV)
     for (x1, y1, x2, y2) in exclusion_zones:
         x1i = max(0, int(x1))
         y1i = max(0, int(y1))
@@ -324,13 +329,12 @@ def _detect_shapes_smart_render(
         y2i = min(h_img, int(y2))
         if x2i > x1i and y2i > y1i:
             binary[y1i:y2i, x1i:x2i] = 0
-    # RETR_TREE: contornos externos e internos con jerarquía (parent = hierarchy[i][3]); permite huecos/centros de letras
     contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if hierarchy is None:
         hierarchy = np.zeros((len(contours), 4), dtype=np.int32)
         hierarchy[:, 3] = -1
     else:
-        hierarchy = hierarchy.reshape(-1, 4)  # OpenCV devuelve (1, N, 4)
+        hierarchy = hierarchy.reshape(-1, 4)
     if out_shapes is not None:
         for i, cnt in enumerate(contours):
             out_shapes[i] = cnt.copy()
@@ -338,7 +342,48 @@ def _detect_shapes_smart_render(
         out_meta["hierarchy"] = hierarchy.copy()
         out_meta["w_px"] = w_img
         out_meta["h_px"] = h_img
-    # Cajas para frontend. Raíces: descartar solo muy pequeños; si una forma ocupa casi toda la imagen (rollo), mantenerla
+    if motor_style:
+        # Filtro bbox Motor: solo w<2 or h<2 or w>w_img*0.99
+        shapes = []
+        for i in range(len(contours)):
+            x, y, w, h = cv2.boundingRect(contours[i])
+            if w < 2 or h < 2 or w > w_img * 0.99:
+                continue
+            path_d = _contour_to_svg_path_d(contours[i], 1.0, 1.0)
+            nx, ny = float(x / w_img), float(y / h_img)
+            nw, nh = float(w / w_img), float(h / h_img)
+            shapes.append({
+                "id": i,
+                "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+                "norm_x": nx, "norm_y": ny, "norm_w": nw, "norm_h": nh,
+                "color": "#ffffff",
+                "is_master": False,
+                "childrenIds": [],
+                "contour_path_d": path_d,
+            })
+        # is_master: contención solo X + esquina superior (no extent Y)
+        for s1 in shapes:
+            for s2 in shapes:
+                if s1["id"] == s2["id"]:
+                    continue
+                if (
+                    s1["norm_x"] <= s2["norm_x"] + 0.005
+                    and s1["norm_y"] <= s2["norm_y"] + 0.005
+                    and (s1["norm_x"] + s1["norm_w"]) >= (s2["norm_x"] + s2["norm_w"]) - 0.005
+                ):
+                    s1["is_master"] = True
+                    break
+        for s1 in shapes:
+            s1["childrenIds"] = [
+                s2["id"]
+                for s2 in shapes
+                if s2["id"] != s1["id"]
+                and s1["norm_x"] <= s2["norm_x"] + 0.005
+                and s1["norm_y"] <= s2["norm_y"] + 0.005
+                and (s1["norm_x"] + s1["norm_w"]) >= (s2["norm_x"] + s2["norm_w"]) - 0.005
+            ]
+        return shapes
+    # Legacy: jerarquía OpenCV, full_image_candidates
     shapes = []
     full_image_candidates = []
     for i in range(len(contours)):
@@ -653,7 +698,7 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                 masters = [s for s in cajas if s.get('is_master')]
                 if not masters and img_detect is not None and (len(img_detect.shape) < 3 or img_detect.shape[2] != 4):
                     cajas_alt = await run_in_threadpool(
-                        _detect_shapes_smart_render, img_detect, [], 128, job_shapes, job_meta
+                        _detect_shapes_smart_render, img_detect, [], 128, job_shapes, job_meta, False
                     )
                     masters_alt = [s for s in cajas_alt if s.get('is_master')]
                     if masters_alt:
