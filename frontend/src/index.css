@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+@theme {
+  --color-dispro-bg: #0A0A0C;
+  --color-dispro-panel: #14151C;
+  --color-dispro-input: #1E202A;
+  --color-dispro-accent: #E31837;
+  --color-dispro-cyan: #00e5ff;
+}
+
+body {
+  background-color: var(--color-dispro-bg);
+  color: white;
+}

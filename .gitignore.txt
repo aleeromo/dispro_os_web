@@ -1,0 +1,24 @@
+# Node / Vite (Frontend)
+node_modules/
+.vite/
+dist/
+.env
+
+# Python (Backend)
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# PyInstaller (¡El culpable del error!)
+backend/app/build/
+backend/app/dist/
+*.spec
+*.exe
+*.pkg
+*.pyz
+
+# SO
+.DS_Store
+Thumbs.db*.pth

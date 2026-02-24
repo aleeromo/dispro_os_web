@@ -1,0 +1,20 @@
+{
+  "precios_3d": {
+    "acrilico_3mm": 960.0,
+    "aluminio_plata": 1900.0,
+    "aluminio_dorado": 2200.0,
+    "aluminio_rosa": 2600.0,
+    "aluminio_mate": 1100.0,
+    "pvc_3mm": 400.0,
+    "led_8cm": 7.5,
+    "fuente_100w": 250.0,
+    "consumibles_fijos": 850.0
+  },
+  "formula_3d": {
+    "mano_obra_por_metro": 90.0,
+    "factor_material": 2.0,
+    "factor_electrico": 1.5,
+    "factor_mo": 1.8,
+    "factor_ganancia": 1.15
+  }
+}
