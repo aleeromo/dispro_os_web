@@ -59,7 +59,7 @@ export function useDispro() {
     },
   });
 
-  // Seam: flete → pdfTotal cuando cambia resultado o configuración de flete (una sola fuente de verdad)
+  // Paso 1: Una sola fuente de verdad para pdfTotal. Flete solo se suma si existe y es número válido; evita NaN.
   useEffect(() => {
     if (!analisis.resultado) return;
     const totalVenta = Number(analisis.resultado.total_venta);
@@ -86,23 +86,38 @@ export function useDispro() {
     }
   }, [appCtx.activeTab, analisis.resultado, appCtx.currentView, projects.selectedProject]);
 
-  // Seam: re-análisis automático al cambiar parámetros de material (no encolar si ya hay petición en vuelo)
+  // Paso 2: Re-análisis automático con debounce 800 ms. No encolar si ya hay petición en vuelo (isCalculating).
   const isFirstRun = useRef(true);
   useEffect(() => {
-    if (isFirstRun.current) { isFirstRun.current = false; return; }
+    if (isFirstRun.current) {
+      isFirstRun.current = false;
+      return;
+    }
     if (
       analisis.resultado &&
       !analisis.isDetecting &&
       !analisis.isCalculating &&
       analisis.archivoSeleccionado
     ) {
-      const timeout = setTimeout(() => analisis.analizar(true), 800);
-      return () => clearTimeout(timeout);
+      const t = setTimeout(() => analisis.analizar(true), 800);
+      return () => clearTimeout(t);
     }
   }, [
-    params.ancho, params.alto, params.materialCara, params.materialCanto,
-    params.profCanto, params.conLuz, params.anchoRollo, params.aluminioTipo,
-    params.colorMate, analisis.cajasIgnoradas, analisis.isCalculating,
+    params.ancho,
+    params.alto,
+    params.materialCara,
+    params.materialCanto,
+    params.profCanto,
+    params.conLuz,
+    params.anchoRollo,
+    params.aluminioTipo,
+    params.colorMate,
+    analisis.cajasIgnoradas,
+    analisis.isCalculating,
+    analisis.resultado,
+    analisis.isDetecting,
+    analisis.archivoSeleccionado,
+    analisis.analizar,
   ]);
 
   // Bridge: cotizador → PDF + navegación
