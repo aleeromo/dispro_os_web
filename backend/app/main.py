@@ -354,10 +354,12 @@ async def preprocesar_imagen(file: UploadFile = File(...)):
             if 'cm' in unit: return v / 100.0
             return v 
 
+        # Umbral bajo para no perder medidas/cotas en la imagen (tu método: letras + medidas en la misma imagen)
+        _ocr_opts = {"text_threshold": 0.4, "low_text": 0.35} if READER is not None else {}
         if READER is not None:
             try:
                 h_meds, v_meds = [], []
-                res_ocr = READER.readtext(img_ocr)
+                res_ocr = READER.readtext(img_ocr, **_ocr_opts)
                 txt_h = ""
                 for (bbox, text, prob) in res_ocr:
                     txt_h += f" {text.lower()} "
@@ -372,7 +374,7 @@ async def preprocesar_imagen(file: UploadFile = File(...)):
 
                 img_rot_cw = cv2.rotate(img_ocr, cv2.ROTATE_90_CLOCKWISE)
                 rot_h_px_cw, rot_w_px_cw = img_rot_cw.shape[:2]
-                res_ocr_rot = READER.readtext(img_rot_cw)
+                res_ocr_rot = READER.readtext(img_rot_cw, **_ocr_opts)
                 txt_v = ""
                 for (bbox, text, prob) in res_ocr_rot:
                     txt_v += f" {text.lower()} "
@@ -389,7 +391,7 @@ async def preprocesar_imagen(file: UploadFile = File(...)):
 
                 img_rot_ccw = cv2.rotate(img_ocr, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 rot_h_px_ccw, rot_w_px_ccw = img_rot_ccw.shape[:2]
-                res_ocr_rot_ccw = READER.readtext(img_rot_ccw)
+                res_ocr_rot_ccw = READER.readtext(img_rot_ccw, **_ocr_opts)
                 txt_v_ccw = ""
                 for (bbox, text, prob) in res_ocr_rot_ccw:
                     txt_v_ccw += f" {text.lower()} "
@@ -409,6 +411,14 @@ async def preprocesar_imagen(file: UploadFile = File(...)):
                 v_meds_s = sorted(list(set(v_meds)), reverse=True)
                 wm = h_meds_s[0] if h_meds_s else (all_meds[0] if all_meds else 1.0)
                 hm = v_meds_s[0] if v_meds_s else (all_meds[1] if len(all_meds) > 1 else wm * (float(h_px) / float(w_px)))
+                # Si hay medidas extraídas (número + unidad) o texto tipo cota en la imagen → Letras 3D (tu método: medidas en la imagen)
+                if h_meds or v_meds:
+                    modo_detectado = '3D'
+                else:
+                    for combined in (txt_h, txt_v, txt_v_ccw):
+                        if _REGEX_COTA.search(combined):
+                            modo_detectado = '3D'
+                            break
             except Exception as e:
                 print(f"[ERROR OCR] preprocesar_imagen: {e}", flush=True)
 
