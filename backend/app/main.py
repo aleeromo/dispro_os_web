@@ -152,10 +152,10 @@ def _children_from_hierarchy(hierarchy: np.ndarray, i: int) -> list:
     return out
 
 
-def _detect_shapes_smart_render(img: np.ndarray, exclusion_zones: list = None) -> list:
-    """Detección para nesting: umbral 200, RETR_TREE (contornos externos + interiores/huecos).
+def _detect_shapes_smart_render(img: np.ndarray, exclusion_zones: list = None, gray_threshold: int = 200) -> list:
+    """Detección para nesting: umbral por defecto 200, RETR_TREE (contornos externos + interiores/huecos).
     Rellena TEMP_SHAPES_CACHE (id → contorno), TEMP_PREPROCESS_META (w_px, h_px, hierarchy).
-    La jerarquía real se usa en analizar para que engine_3d asigne huecos (centros de 'a','e','o','d') a cada pieza."""
+    gray_threshold: umbral para imágenes sin alpha; más bajo (p. ej. 128) detecta más formas suaves/texto."""
     TEMP_SHAPES_CACHE.clear()
     TEMP_PREPROCESS_META.clear()
     exclusion_zones = exclusion_zones or []
@@ -166,7 +166,7 @@ def _detect_shapes_smart_render(img: np.ndarray, exclusion_zones: list = None) -
         binary = (alpha >= 128).astype(np.uint8) * 255  # opaco = figura (255), transparente = hueco/fondo (0)
     else:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        _, binary = cv2.threshold(gray, gray_threshold, 255, cv2.THRESH_BINARY_INV)
     for (x1, y1, x2, y2) in exclusion_zones:
         x1i = max(0, int(x1))
         y1i = max(0, int(y1))
@@ -437,12 +437,27 @@ async def preprocesar_imagen(file: UploadFile = File(...)):
                 if img_detect is None:
                     img_detect = img_cv
                 cajas = await run_in_threadpool(_detect_shapes_smart_render, img_detect, [])
-                # Inferir modo: si hay varias piezas raíz o una con huecos (letras tipo a,e,o,d) → Letras 3D; si no → Rollo.
                 masters = [s for s in cajas if s.get('is_master')]
+                # Si no se detectó ninguna forma raíz, intentar con umbral más bajo (capta texto/formas suaves)
+                if not masters and img_detect is not None and (len(img_detect.shape) < 3 or img_detect.shape[2] != 4):
+                    cajas_alt = await run_in_threadpool(_detect_shapes_smart_render, img_detect, [], 128)
+                    masters_alt = [s for s in cajas_alt if s.get('is_master')]
+                    if masters_alt:
+                        cajas = cajas_alt
+                        masters = masters_alt
+                # Inferir modo Letras 3D vs Rollo
                 if masters:
-                    if len(masters) > 1 or (masters[0].get('childrenIds')):
+                    # Varias piezas o una con huecos (a,e,o,d) → Letras 3D
+                    if len(masters) > 1 or masters[0].get('childrenIds'):
                         modo_detectado = '3D'
-                    # Si OCR ya marcó 3D (p. ej. por cotas), mantenerlo aunque solo haya una pieza
+                    # Sin OCR: cualquier forma detectada se considera Letras 3D (tu método: medidas en imagen)
+                    elif READER is None:
+                        modo_detectado = '3D'
+                    # Una sola pieza con OCR: 3D si no ocupa casi toda la imagen (no es rollo completo)
+                    elif len(masters) == 1:
+                        cov = masters[0].get('norm_w', 0) * masters[0].get('norm_h', 0)
+                        if cov < 0.85:
+                            modo_detectado = '3D'
                 elif not cajas and modo_detectado != '3D':
                     modo_detectado = 'ROLLO'
             except HTTPException:
