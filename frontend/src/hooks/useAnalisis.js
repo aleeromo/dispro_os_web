@@ -38,6 +38,7 @@ export function useAnalisis({ modo, onAnalisisComplete, onArchivoDetectado, getP
   const [tempCajaMaster,       setTempCajaMaster]      = useState(null);
   const [tempVinylType,       setTempVinylType]       = useState('corte');
   const [tempVinylColor,      setTempVinylColor]      = useState('#2563eb');
+  const [jobId,               setJobId]              = useState(null);
 
   const globalInputRef = useRef(null);
   const bgInputRef     = useRef(null);
@@ -80,7 +81,11 @@ export function useAnalisis({ modo, onAnalisisComplete, onArchivoDetectado, getP
     try {
       const fd = new FormData();
       fd.append('file', f);
-      const res = await axios.post(`${API_BASE}/api/v1/preprocesar`, fd);
+      const headers = {};
+      if (jobId) headers['X-Job-Id'] = jobId;
+      const res = await axios.post(`${API_BASE}/api/v1/preprocesar`, fd, { headers });
+      const returnedJobId = res.data.job_id;
+      if (returnedJobId) setJobId(returnedJobId);
       setImgData({
         wPx: res.data.ancho_px,
         hPx: res.data.alto_px,
@@ -110,14 +115,22 @@ export function useAnalisis({ modo, onAnalisisComplete, onArchivoDetectado, getP
         onArchivoDetectado?.({ modo: detModo, materialCara: 'Acrílico', anchoRollo: null, ancho: wF.toFixed(2), alto: hF.toFixed(2) });
       }
       onFileReady?.();
-    } catch {
-      setErrorMsg('No se pudo conectar con el servidor. Comprueba que el backend DisproOS esté en marcha (p. ej. puerto 8000).');
+    } catch (err) {
+      const res = err.response;
+      if (res?.status === 404 && res?.data?.code === 'JOB_NOT_FOUND') {
+        setErrorMsg('La sesión expiró o no es válida. Carga de nuevo la imagen.');
+        setJobId(null);
+      } else if (res?.status === 400 && res?.data?.message) {
+        setErrorMsg(res.data.message);
+      } else {
+        setErrorMsg('No se pudo conectar con el servidor. Comprueba que el backend DisproOS esté en marcha (p. ej. puerto 8000).');
+      }
       setPreview(null);
       setArchivoSeleccionado(null);
     } finally {
       setIsDetecting(false);
     }
-  }, [onArchivoDetectado, onFileReady, onNavigateToEstudio]);
+  }, [jobId, onArchivoDetectado, onFileReady, onNavigateToEstudio]);
 
   const confirmarMedidaPrint = useCallback(() => {
     const p = getParamsForAnalysis?.() || {};
@@ -304,17 +317,27 @@ export function useAnalisis({ modo, onAnalisisComplete, onArchivoDetectado, getP
       };
     });
     fd.append('classifications', JSON.stringify(classificationsArray));
+    const headers = {};
+    if (jobId) headers['X-Job-Id'] = jobId;
     try {
-      const res = await axios.post(`${API_BASE}/api/v1/analizar`, fd);
+      const res = await axios.post(`${API_BASE}/api/v1/analizar`, fd, { headers });
       setResultado(res.data);
       const fleteCosto = conFlete && infoFlete ? infoFlete.total : 0;
       onAnalisisComplete?.(res.data, fleteCosto, isAuto);
-    } catch {
-      setErrorMsg('Fallo en cálculo vectorial.');
+    } catch (err) {
+      const res = err.response;
+      if (res?.status === 404 && res?.data?.code === 'JOB_NOT_FOUND') {
+        setErrorMsg('La sesión expiró o no es válida. Carga de nuevo la imagen.');
+        setJobId(null);
+      } else if (res?.status === 400 && res?.data?.message) {
+        setErrorMsg(res.data.message);
+      } else {
+        setErrorMsg('Fallo en cálculo vectorial.');
+      }
     } finally {
       setIsCalculating(false);
     }
-  }, [archivoSeleccionado, cajasIgnoradas, cajas, classifications, conFlete, infoFlete, getParamsForAnalysis, onAnalisisComplete]);
+  }, [archivoSeleccionado, jobId, cajasIgnoradas, cajas, classifications, conFlete, infoFlete, getParamsForAnalysis, onAnalisisComplete]);
 
   // Computed: nesting / CNC — deben coincidir con backend (engine_3d: pw_m, ph_m, gap 0.3)
   const isAluminio = useMemo(
@@ -334,6 +357,18 @@ export function useAnalisis({ modo, onAnalisisComplete, onArchivoDetectado, getP
     () => ['ajuste', ...(modo === '3D' && resultado ? ['render'] : []), ...(resultado ? ['planos'] : []), 'pdf'],
     [modo, resultado]
   );
+
+  const resetEstudio = useCallback(() => {
+    setJobId(null);
+    setPreview(null);
+    setResultado(null);
+    setArchivoSeleccionado(null);
+    setCajas([]);
+    setCajasIgnoradas([]);
+    setSelectedCajas([]);
+    setClassifications({});
+    setErrorMsg(null);
+  }, []);
 
   return {
     resultado,  setResultado,
@@ -382,5 +417,8 @@ export function useAnalisis({ modo, onAnalisisComplete, onArchivoDetectado, getP
     isAluminio,
     sheetW, sheetH, gap, numPlacas, viewBoxStr,
     tabsDisponibles,
+    jobId,
+    setJobId,
+    resetEstudio,
   };
 }

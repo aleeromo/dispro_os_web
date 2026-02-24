@@ -127,13 +127,11 @@ export function useDispro() {
     appCtx.setActiveTab('pdf');
   }, [pdf, appCtx]);
 
-  // Bridge: home → reset estudio
+  // Bridge: home → reset estudio (limpia sesión y genera nuevo job id en la próxima carga)
   const handleHomeClick = useCallback(() => {
     appCtx.setCurrentView('estudio');
     appCtx.setActiveTab('ajuste');
-    analisis.setPreview(null);
-    analisis.setResultado(null);
-    analisis.setArchivoSeleccionado(null);
+    analisis.resetEstudio?.();
   }, [appCtx, analisis]);
 
   // Wrapper: descargar SVG CNC usando folio actual del PDF

@@ -1,9 +1,10 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 import numpy as np
+import uuid
 import cv2
 import math
 import re
@@ -46,6 +47,15 @@ from core.database import DataBase
 from core.engine_3d import NestingEngineAPI
 from core.engine_print import MotorIndustrialAPI
 from core import pricing_config
+from constants import (
+    JOB_STORE_TTL_SECONDS,
+    JOB_STORE_MAX_JOBS,
+    MAX_FILE_SIZE_BYTES,
+    MIN_IMAGE_WIDTH_PX,
+    MIN_IMAGE_HEIGHT_PX,
+    ALLOWED_IMAGE_EXTENSIONS,
+    ALLOWED_IMAGE_CONTENT_TYPES,
+)
 
 try:
     from core.segmentation import segmentar_imagen, segmentar_piezas, segmentar_piezas_por_contornos
@@ -55,9 +65,81 @@ except ImportError as e:
     print(f"[ERROR CRÍTICO] Módulos de visión no disponibles: {e}", flush=True)
     _VISION_OK = False
 
-TEMP_CONTOURS_CACHE = {}
-TEMP_SHAPES_CACHE: Dict[int, np.ndarray] = {}  # Motor: id (int) -> contorno, usado para generate-svg y analizar 3D
-TEMP_PREPROCESS_META = {}  
+# --- Almacén por job (Fase 1). Job id: header X-Job-Id o query job_id. ---
+# Estructura: job_id -> { "shapes": {id: contorno}, "meta": {w_px, h_px, hierarchy}, "ancho_m", "alto_m", "modo", "created_at" }
+_JOB_STORE: Dict[str, dict] = {}
+_JOB_STORE_ORDER: List[str] = []  # para expirar los más antiguos
+
+
+def _get_job_id_from_request(request: Request, x_job_id: Optional[str] = Header(None, alias="X-Job-Id")) -> Optional[str]:
+    """Obtiene job_id del header X-Job-Id o del query param job_id. Uno u otro debe usarse de forma consistente."""
+    if x_job_id and str(x_job_id).strip():
+        return str(x_job_id).strip()
+    q = request.query_params.get("job_id")
+    if q and str(q).strip():
+        return str(q).strip()
+    return None
+
+
+def _job_store_cleanup():
+    """Elimina jobs expirados (TTL) y si aún hay más de JOB_STORE_MAX_JOBS, elimina los más antiguos."""
+    now = time.time()
+    to_remove = []
+    for jid in _JOB_STORE_ORDER:
+        if jid not in _JOB_STORE:
+            to_remove.append(jid)
+            continue
+        if now - _JOB_STORE[jid].get("created_at", 0) > JOB_STORE_TTL_SECONDS:
+            to_remove.append(jid)
+    for jid in to_remove:
+        _JOB_STORE.pop(jid, None)
+        if jid in _JOB_STORE_ORDER:
+            _JOB_STORE_ORDER.remove(jid)
+    while len(_JOB_STORE) > JOB_STORE_MAX_JOBS and _JOB_STORE_ORDER:
+        oldest = _JOB_STORE_ORDER.pop(0)
+        _JOB_STORE.pop(oldest, None)
+
+
+def _job_store_get(job_id: str) -> Optional[dict]:
+    """Devuelve el job si existe y no ha expirado; si expiró lo elimina y devuelve None."""
+    _job_store_cleanup()
+    if job_id not in _JOB_STORE:
+        return None
+    rec = _JOB_STORE[job_id]
+    if time.time() - rec.get("created_at", 0) > JOB_STORE_TTL_SECONDS:
+        _JOB_STORE.pop(job_id, None)
+        if job_id in _JOB_STORE_ORDER:
+            _JOB_STORE_ORDER.remove(job_id)
+        return None
+    return rec
+
+
+def _job_store_set(job_id: str, shapes: Dict[int, np.ndarray], meta: dict, ancho_m: float, alto_m: float, modo: str):
+    """Guarda o actualiza el almacén para un job."""
+    _job_store_cleanup()
+    if job_id in _JOB_STORE_ORDER:
+        _JOB_STORE_ORDER.remove(job_id)
+    _JOB_STORE_ORDER.append(job_id)
+    _JOB_STORE[job_id] = {
+        "shapes": shapes,
+        "meta": meta,
+        "ancho_m": ancho_m,
+        "alto_m": alto_m,
+        "modo": modo,
+        "created_at": time.time(),
+    }
+    while len(_JOB_STORE) > JOB_STORE_MAX_JOBS and _JOB_STORE_ORDER:
+        oldest = _JOB_STORE_ORDER.pop(0)
+        _JOB_STORE.pop(oldest, None)
+
+
+def _error_body(code: str, message: str, details: Optional[dict] = None) -> dict:
+    """Esquema común de error: code, message, details (opcional)."""
+    out = {"code": code, "message": message}
+    if details is not None:
+        out["details"] = details
+    return out
+
 
 app = FastAPI(title='DisproOS API Industrial', version='1.5.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
@@ -109,7 +191,7 @@ class CotizacionResponse(BaseModel):
     url_imagen_procesada: str = ""
 
 def _contour_id_to_index(caja_id) -> int:
-    """Convierte id de caja 'c_0' o 0 a índice de contorno 0 (para TEMP_SHAPES_CACHE)."""
+    """Convierte id de caja 'c_0' o 0 a índice de contorno (para almacén shapes por job)."""
     if caja_id is None:
         return -1
     if isinstance(caja_id, int):
@@ -152,12 +234,20 @@ def _children_from_hierarchy(hierarchy: np.ndarray, i: int) -> list:
     return out
 
 
-def _detect_shapes_smart_render(img: np.ndarray, exclusion_zones: list = None, gray_threshold: int = 200) -> list:
+def _detect_shapes_smart_render(
+    img: np.ndarray,
+    exclusion_zones: list = None,
+    gray_threshold: int = 200,
+    out_shapes: Optional[Dict[int, np.ndarray]] = None,
+    out_meta: Optional[dict] = None,
+) -> list:
     """Detección para nesting: umbral por defecto 200, RETR_TREE (contornos externos + interiores/huecos).
-    Rellena TEMP_SHAPES_CACHE (id → contorno), TEMP_PREPROCESS_META (w_px, h_px, hierarchy).
+    Escribe en out_shapes (id → contorno) y out_meta (w_px, h_px, hierarchy). Si no se pasan, no guarda (solo devuelve shapes).
     gray_threshold: umbral para imágenes sin alpha; más bajo (p. ej. 128) detecta más formas suaves/texto."""
-    TEMP_SHAPES_CACHE.clear()
-    TEMP_PREPROCESS_META.clear()
+    if out_shapes is not None:
+        out_shapes.clear()
+    if out_meta is not None:
+        out_meta.clear()
     exclusion_zones = exclusion_zones or []
     h_img, w_img = img.shape[:2]
     # Máscara binaria: si hay alpha (PNG con transparencia), usarla para preservar huecos (transparente = fondo)
@@ -181,12 +271,13 @@ def _detect_shapes_smart_render(img: np.ndarray, exclusion_zones: list = None, g
         hierarchy[:, 3] = -1
     else:
         hierarchy = hierarchy.reshape(-1, 4)  # OpenCV devuelve (1, N, 4)
-    # Cache: id = índice OpenCV (0..N-1) para que la jerarquía siga siendo válida
-    for i, cnt in enumerate(contours):
-        TEMP_SHAPES_CACHE[i] = cnt.copy()
-    TEMP_PREPROCESS_META["hierarchy"] = hierarchy.copy()
-    TEMP_PREPROCESS_META["w_px"] = w_img
-    TEMP_PREPROCESS_META["h_px"] = h_img
+    if out_shapes is not None:
+        for i, cnt in enumerate(contours):
+            out_shapes[i] = cnt.copy()
+    if out_meta is not None:
+        out_meta["hierarchy"] = hierarchy.copy()
+        out_meta["w_px"] = w_img
+        out_meta["h_px"] = h_img
     # Cajas para frontend: una por contorno. Raíces: filtro tamaño para evitar ruido; hijos (huecos): siempre mostrar
     shapes = []
     for i in range(len(contours)):
@@ -316,15 +407,56 @@ def calcular_flete(destino: str):
     
     return {"distancia": round(dist_km), "tiempo": round(time_h, 1), "total": total_flete, "desglose": f"Gasolina: ${gas:.0f} | Casetas: ${casetas:.0f} | Viáticos: ${viaticos:.0f} | Hospedaje: ${hospedaje:.0f}"}
 
+def _resolve_modo_final(modo_from_ocr: str, cajas: list, reader_available: bool) -> str:
+    """
+    Punto único de decisión modo 3D vs ROLLO (detección/clasificación).
+    Orden y condiciones:
+    1. Si ya vino 3D por OCR (dígitos, cotas o medidas h_meds/v_meds), se mantiene 3D salvo que formas indiquen rollo.
+    2. Si hay piezas raíz (masters): varias piezas o una con huecos (childrenIds) → 3D.
+    3. Sin OCR (reader_available=False): cualquier forma detectada → 3D.
+    4. Una sola pieza raíz con OCR: 3D si cobertura < 0.85 (no ocupa casi toda la imagen).
+    5. Sin cajas y modo no era 3D → ROLLO.
+    """
+    masters = [s for s in cajas if s.get("is_master")]
+    if not masters:
+        return "ROLLO" if modo_from_ocr != "3D" else "3D"
+    if len(masters) > 1 or (masters[0].get("childrenIds")):
+        return "3D"
+    if not reader_available:
+        return "3D"
+    if len(masters) == 1:
+        cov = masters[0].get("norm_w", 0) * masters[0].get("norm_h", 0)
+        if cov < 0.85:
+            return "3D"
+    return modo_from_ocr
+
+
 @app.get('/api/v1/health')
 def health():
     """Comprueba que en este puerto corre el backend DisproOS (no otro servicio)."""
     return {"status": "ok", "app": "DisproOS"}
 
+
 @app.post('/api/v1/preprocesar')
-async def preprocesar_imagen(file: UploadFile = File(...)):
+async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_job_id: Optional[str] = Header(None, alias="X-Job-Id")):
+    """Acepta job id en header X-Job-Id o query job_id. Si no viene, genera uno y lo devuelve. Guarda contornos y meta en almacén por job."""
+    job_id = _get_job_id_from_request(request) or str(uuid.uuid4())
     try:
+        # Validación: tipo y tamaño de archivo
+        if not file.filename:
+            raise HTTPException(status_code=400, detail=_error_body("INVALID_FILE", "No se envió archivo.", {"filename": file.filename}))
+        ext = (file.filename or "").lower()
+        if not any(ext.endswith(e) for e in ALLOWED_IMAGE_EXTENSIONS):
+            raise HTTPException(
+                status_code=400,
+                detail=_error_body("INVALID_FILE", "Tipo de archivo no permitido. Use imagen (png, jpg, gif, webp, bmp).", {"filename": file.filename}),
+            )
         contents = await file.read()
+        if len(contents) > MAX_FILE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=_error_body("INVALID_FILE", f"Archivo demasiado grande. Máximo {MAX_FILE_SIZE_BYTES // (1024*1024)} MB.", {"size": len(contents)}),
+            )
         def decodificar_imagen(data):
             img_un = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
             if img_un is None: return None
@@ -335,11 +467,16 @@ async def preprocesar_imagen(file: UploadFile = File(...)):
                 blanco = np.ones_like(bgr, dtype=np.uint8) * 255
                 return np.where(alpha[:, :, np.newaxis] == 0, blanco, bgr)
             return img_un
-            
+
         img_cv = await run_in_threadpool(decodificar_imagen, contents)
-        if img_cv is None: raise ValueError("Imagen corrupta")
-            
+        if img_cv is None:
+            raise HTTPException(status_code=400, detail=_error_body("INVALID_FILE", "Imagen corrupta o formato no soportado."))
         h_px, w_px = img_cv.shape[:2]
+        if h_px < MIN_IMAGE_HEIGHT_PX or w_px < MIN_IMAGE_WIDTH_PX:
+            raise HTTPException(
+                status_code=400,
+                detail=_error_body("INVALID_FILE", f"Dimensiones mínimas {MIN_IMAGE_WIDTH_PX}x{MIN_IMAGE_HEIGHT_PX} px.", {"w_px": w_px, "h_px": h_px}),
+            )
         modo_detectado = 'ROLLO'
         wm, hm = 1.0, 1.0
         cajas = []
@@ -422,6 +559,10 @@ async def preprocesar_imagen(file: UploadFile = File(...)):
             except Exception as e:
                 print(f"[ERROR OCR] preprocesar_imagen: {e}", flush=True)
 
+        # Almacén por job: contornos y meta se guardan aquí
+        job_shapes: Dict[int, np.ndarray] = {}
+        job_meta: dict = {}
+
         # Detección de piezas: siempre que esté en 3D o la detección automática esté activa (para distinguir Letras 3D vs Rollo).
         if modo_detectado == '3D' or DETECCION_AUTOMATICA_PIEZAS:
             try:
@@ -429,58 +570,63 @@ async def preprocesar_imagen(file: UploadFile = File(...)):
                     img_un = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
                     if img_un is None:
                         return None
-                    # Mantener alpha (4 canales) para que la detección use transparencia = huecos (centros de a, e, o, d)
                     if img_un.ndim == 2:
                         return cv2.cvtColor(img_un, cv2.COLOR_GRAY2BGR)
                     return img_un
                 img_detect = await run_in_threadpool(imagen_para_deteccion, contents)
                 if img_detect is None:
                     img_detect = img_cv
-                cajas = await run_in_threadpool(_detect_shapes_smart_render, img_detect, [])
+                cajas = await run_in_threadpool(
+                    _detect_shapes_smart_render, img_detect, [], 200, job_shapes, job_meta
+                )
                 masters = [s for s in cajas if s.get('is_master')]
-                # Si no se detectó ninguna forma raíz, intentar con umbral más bajo (capta texto/formas suaves)
                 if not masters and img_detect is not None and (len(img_detect.shape) < 3 or img_detect.shape[2] != 4):
-                    cajas_alt = await run_in_threadpool(_detect_shapes_smart_render, img_detect, [], 128)
+                    cajas_alt = await run_in_threadpool(
+                        _detect_shapes_smart_render, img_detect, [], 128, job_shapes, job_meta
+                    )
                     masters_alt = [s for s in cajas_alt if s.get('is_master')]
                     if masters_alt:
                         cajas = cajas_alt
                         masters = masters_alt
-                # Inferir modo Letras 3D vs Rollo
-                if masters:
-                    # Varias piezas o una con huecos (a,e,o,d) → Letras 3D
-                    if len(masters) > 1 or masters[0].get('childrenIds'):
-                        modo_detectado = '3D'
-                    # Sin OCR: cualquier forma detectada se considera Letras 3D (tu método: medidas en imagen)
-                    elif READER is None:
-                        modo_detectado = '3D'
-                    # Una sola pieza con OCR: 3D si no ocupa casi toda la imagen (no es rollo completo)
-                    elif len(masters) == 1:
-                        cov = masters[0].get('norm_w', 0) * masters[0].get('norm_h', 0)
-                        if cov < 0.85:
-                            modo_detectado = '3D'
-                elif not cajas and modo_detectado != '3D':
-                    modo_detectado = 'ROLLO'
+                modo_detectado = _resolve_modo_final(modo_detectado, cajas, READER is not None)
             except HTTPException:
                 raise
             except Exception as e:
                 print(f"[ERROR DETECCIÓN SMART RENDER] preprocesar_imagen: {e}", flush=True)
-                raise HTTPException(status_code=500, detail=f"Error en detección (Smart Render): {e}")
+                raise HTTPException(status_code=500, detail=_error_body("DETECTION_ERROR", f"Error en detección (Smart Render): {e}"))
 
-        return {'modo': str(modo_detectado), 'ancho_m': float(round(wm, 2)), 'alto_m': float(round(hm, 2)), 'cajas': cajas, 'ancho_px': int(w_px), 'alto_px': int(h_px)}
-    except Exception as e: 
-        raise HTTPException(status_code=500, detail=str(e))
+        _job_store_set(job_id, job_shapes, job_meta, float(round(wm, 2)), float(round(hm, 2)), str(modo_detectado))
+        return {
+            'job_id': job_id,
+            'modo': str(modo_detectado),
+            'ancho_m': float(round(wm, 2)),
+            'alto_m': float(round(hm, 2)),
+            'cajas': cajas,
+            'ancho_px': int(w_px),
+            'alto_px': int(h_px),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_error_body("SERVER_ERROR", str(e)))
 
 @app.post('/api/v1/generate-svg')
-async def generate_svg(req: GenerateSvgRequest):
-    """Genera SVG con clasificaciones tipo Motor (letra3d, caja, rotulo, hueco, ignorar) y huecos. Usa TEMP_SHAPES_CACHE del último preprocesar."""
+async def generate_svg(request: Request, req: GenerateSvgRequest, x_job_id: Optional[str] = Header(None, alias="X-Job-Id")):
+    """Genera SVG con clasificaciones tipo Motor. Requiere job id (header X-Job-Id o query job_id). Usa contornos del almacén para ese job."""
+    job_id = _get_job_id_from_request(request)
+    if not job_id:
+        raise HTTPException(status_code=400, detail=_error_body("JOB_ID_REQUIRED", "Se requiere job_id (header X-Job-Id o query job_id)."))
+    job = _job_store_get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=_error_body("JOB_NOT_FOUND", "La sesión expiró o no es válida. Carga de nuevo la imagen."))
     try:
         w_img = req.imageWidth
         h_img = req.imageHeight
         if w_img < 1 or h_img < 1:
-            raise HTTPException(status_code=400, detail="imageWidth e imageHeight requeridos")
+            raise HTTPException(status_code=400, detail=_error_body("INVALID_INPUT", "imageWidth e imageHeight requeridos."))
         shapes = [{"id": s.id, "type": s.type or "letra3d", "material": s.material or "acrilico", "color": s.color or "#ffffff"} for s in req.shapes]
         svg_str = _build_svg_motor_style(
-            TEMP_SHAPES_CACHE,
+            job["shapes"],
             shapes,
             viewbox_w=float(w_img),
             viewbox_h=float(h_img),
@@ -491,7 +637,7 @@ async def generate_svg(req: GenerateSvgRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_error_body("SERVER_ERROR", str(e)))
 
 def _limpiar_y_procesar_imagen_3d(img_cv: np.ndarray, exclusion_zones: list) -> str:
     import base64
@@ -538,12 +684,22 @@ def _limpiar_y_procesar_imagen_3d(img_cv: np.ndarray, exclusion_zones: list) -> 
 
 @app.post('/api/v1/analizar', response_model=CotizacionResponse)
 async def analizar_proyecto(
-    file: UploadFile = File(...), modo: str = Form(...), material_cara: str = Form("Acrílico"), 
-    aluminio_tipo: str = Form("Plata"), material_canto: str = Form("Aluminio"), prof_canto: float = Form(0.06), 
-    ancho_m: float = Form(...), alto_m: float = Form(...), con_luz: str = Form("false"), 
-    ancho_rollo: float = Form(1.27), boxes_ignoradas: str = Form(''), 
-    classifications: str = Form('')
+    request: Request,
+    file: UploadFile = File(...), modo: str = Form(...), material_cara: str = Form("Acrílico"),
+    aluminio_tipo: str = Form("Plata"), material_canto: str = Form("Aluminio"), prof_canto: float = Form(0.06),
+    ancho_m: float = Form(...), alto_m: float = Form(...), con_luz: str = Form("false"),
+    ancho_rollo: float = Form(1.27), boxes_ignoradas: str = Form(''),
+    classifications: str = Form(''),
 ):
+    job_id = _get_job_id_from_request(request)
+    if not job_id:
+        raise HTTPException(status_code=400, detail=_error_body("JOB_ID_REQUIRED", "Se requiere job_id (header X-Job-Id o query job_id)."))
+    job = _job_store_get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=_error_body("JOB_NOT_FOUND", "La sesión expiró o no es válida. Carga de nuevo la imagen."))
+    store_shapes = job["shapes"]
+    store_meta = job["meta"]
+
     contents = await file.read()
     def decodificar_imagen(data):
         img_un = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
@@ -611,35 +767,38 @@ async def analizar_proyecto(
                 except ValueError: pass
 
         use_cache = (
-            TEMP_PREPROCESS_META.get("w_px") == w_px
-            and TEMP_PREPROCESS_META.get("h_px") == h_px
-            and len(TEMP_SHAPES_CACHE) > 0
+            store_meta.get("w_px") == w_px
+            and store_meta.get("h_px") == h_px
+            and len(store_shapes) > 0
         )
         cnts_list = None
         if use_cache:
-            cnts_list = [TEMP_SHAPES_CACHE[i] for i in sorted(TEMP_SHAPES_CACHE.keys())]
+            cnts_list = [store_shapes[i] for i in sorted(store_shapes.keys())]
         if (cnts_list is None or len(cnts_list) == 0) and img_cv is not None:
-            # Solución de raíz: si no hay caché usable, detectar contornos en la imagen actual y usarlos para nesting
             try:
-                await run_in_threadpool(_detect_shapes_smart_render, img_cv, exclusion_zones)
-                cnts_list = [TEMP_SHAPES_CACHE[i] for i in sorted(TEMP_SHAPES_CACHE.keys())]
+                job_shapes_fallback: Dict[int, np.ndarray] = {}
+                job_meta_fallback: dict = {}
+                await run_in_threadpool(_detect_shapes_smart_render, img_cv, exclusion_zones, 200, job_shapes_fallback, job_meta_fallback)
+                cnts_list = [job_shapes_fallback[i] for i in sorted(job_shapes_fallback.keys())]
                 use_cache = len(cnts_list) > 0
+                if use_cache:
+                    store_shapes = job_shapes_fallback
+                    store_meta = job_meta_fallback
             except Exception as _e:
                 print(f"[analizar] Fallback detección en analizar: {_e}", flush=True)
 
-        # ignoradas: el motor recibe rectas (x_y_w_h) y salta contornos cuyo centro cae en ellas
         ignoradas = []
         for cid in ignored_ids:
-            if cid in TEMP_SHAPES_CACHE:
-                cnt = TEMP_SHAPES_CACHE[cid]
+            if cid in store_shapes:
+                cnt = store_shapes[cid]
                 x, y, w, h = cv2.boundingRect(cnt)
                 ignoradas.append(f"{int(x)}_{int(y)}_{int(w)}_{int(h)}")
 
         if cnts_list and len(cnts_list) > 0:
             n = len(cnts_list)
             # Usar jerarquía real si existe (RETR_TREE) para que engine_3d asigne huecos (depth % 2 != 0)
-            if "hierarchy" in TEMP_PREPROCESS_META:
-                hierarchy = np.asarray(TEMP_PREPROCESS_META["hierarchy"], dtype=np.int32)
+            if "hierarchy" in store_meta:
+                hierarchy = np.asarray(store_meta["hierarchy"], dtype=np.int32)
                 if hierarchy.shape[0] != n:
                     hierarchy = np.zeros((n, 4), dtype=np.int32)
                     hierarchy[:, 3] = -1
@@ -682,14 +841,14 @@ async def analizar_proyecto(
                 mat_norm = "aluminio" if "aluminio" in str(material_cara).lower() else "acrilico"
                 cl_list = [
                     {"id": idx, "type": "letra3d", "material": mat_norm, "color": "#ffffff"}
-                    for idx in sorted(TEMP_SHAPES_CACHE.keys())
+                    for idx in sorted(store_shapes.keys())
                     if idx not in ignored_ids
                 ]
             if cl_list:
                 scale_x = iw / float(w_px)
                 scale_y = ih / float(h_px)
                 full_svg_str = _build_svg_motor_style(
-                    TEMP_SHAPES_CACHE,
+                    store_shapes,
                     cl_list,
                     viewbox_w=iw,
                     viewbox_h=ih,

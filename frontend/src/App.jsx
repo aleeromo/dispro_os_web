@@ -74,7 +74,7 @@ export default function App() {
           />
         )}
 
-        <ErrorToast isDarkMode={d.isDarkMode} errorMsg={d.errorMsg} setErrorMsg={d.setErrorMsg} />
+        <ErrorToast isDarkMode={d.isDarkMode} errorMsg={d.errorMsg} setErrorMsg={d.setErrorMsg} onReiniciar={d.resetEstudio} />
 
         {d.showSaveModal && (
           <SaveProjectModal
