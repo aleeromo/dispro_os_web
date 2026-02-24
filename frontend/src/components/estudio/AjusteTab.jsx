@@ -78,12 +78,12 @@ export function AjusteTab({
   };
 
   const handleMouseDown = useCallback((e) => {
-    if (modo !== '3D' || !cajas?.length) return;
+    if (!cajas?.length) return;
     const coords = getNormCoords(e);
     setDragStart(coords);
     setDragCurrent(coords);
     setIsDragging(true);
-  }, [modo, cajas, getNormCoords]);
+  }, [cajas, getNormCoords]);
 
   const handleMouseMove = useCallback((e) => {
     if (!isDragging || !dragStart) return;
@@ -180,7 +180,7 @@ export function AjusteTab({
             />
           )}
 
-        {modo === '3D' && Array.isArray(cajas) && cajas.length > 0 && (
+        {Array.isArray(cajas) && cajas.length > 0 && (
           <div className="absolute inset-0 w-full h-full pointer-events-none" aria-hidden="true">
             {/* Sombreado azul por path (forma real) cuando existe contour_path_d */}
             {cajas.some((c) => c?.contour_path_d) ? (

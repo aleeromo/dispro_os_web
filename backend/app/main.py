@@ -471,11 +471,12 @@ def _resolve_modo_final(modo_from_ocr: str, cajas: list, reader_available: bool)
     """
     Punto único de decisión modo 3D vs ROLLO (detección/clasificación).
     Orden y condiciones:
-    1. Si ya vino 3D por OCR (dígitos, cotas o medidas h_meds/v_meds), se mantiene 3D salvo que formas indiquen rollo.
-    2. Si hay piezas raíz (masters): varias piezas o una con huecos (childrenIds) → 3D.
-    3. Sin OCR (reader_available=False): cualquier forma detectada → 3D.
-    4. Una sola pieza raíz con OCR: 3D si cobertura < 0.85 (no ocupa casi toda la imagen).
-    5. Sin cajas y modo no era 3D → ROLLO.
+    1. Sin masters → ROLLO (salvo que OCR haya dicho 3D y no tengamos formas; entonces 3D).
+    2. Varias piezas raíz o una con huecos (childrenIds) → 3D (letras/cajas).
+    3. Sin OCR: una forma detectada → 3D por defecto.
+    4. Una sola pieza raíz con OCR: si cobertura >= 0.80 (ocupa casi toda la imagen) → ROLLO
+       aunque haya medidas en la imagen (formato de rollo con cotas). Si cobertura < 0.80 → 3D.
+    5. Resto: modo_from_ocr.
     """
     masters = [s for s in cajas if s.get("is_master")]
     if not masters:
@@ -486,7 +487,9 @@ def _resolve_modo_final(modo_from_ocr: str, cajas: list, reader_available: bool)
         return "3D"
     if len(masters) == 1:
         cov = masters[0].get("norm_w", 0) * masters[0].get("norm_h", 0)
-        if cov < 0.85:
+        if cov >= 0.80:
+            return "ROLLO"
+        if cov < 0.80:
             return "3D"
     return modo_from_ocr
 
@@ -654,6 +657,19 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
             except Exception as e:
                 print(f"[ERROR DETECCIÓN SMART RENDER] preprocesar_imagen: {e}", flush=True)
                 raise HTTPException(status_code=500, detail=_error_body("DETECTION_ERROR", f"Error en detección (Smart Render): {e}"))
+
+        # Si no se detectó ninguna caja, añadir una “imagen completa” para que siempre aparezca al menos una caja de selección (ROLLO o 3D)
+        if not cajas:
+            path_d_full = f"M 0 0 L {w_px} 0 L {w_px} {h_px} L 0 {h_px} Z"
+            cajas = [{
+                "id": 0,
+                "x": 0, "y": 0, "w": w_px, "h": h_px,
+                "norm_x": 0.0, "norm_y": 0.0, "norm_w": 1.0, "norm_h": 1.0,
+                "color": "#ffffff",
+                "is_master": True,
+                "childrenIds": [],
+                "contour_path_d": path_d_full,
+            }]
 
         _job_store_set(job_id, job_shapes, job_meta, float(round(wm, 2)), float(round(hm, 2)), str(modo_detectado))
         return {
