@@ -338,15 +338,20 @@ def _detect_shapes_smart_render(
         out_meta["hierarchy"] = hierarchy.copy()
         out_meta["w_px"] = w_img
         out_meta["h_px"] = h_img
-    # Cajas para frontend: una por contorno. Raíces: filtro tamaño para evitar ruido; hijos (huecos): siempre mostrar
+    # Cajas para frontend. Raíces: descartar solo muy pequeños; si una forma ocupa casi toda la imagen (rollo), mantenerla
     shapes = []
+    full_image_candidates = []
     for i in range(len(contours)):
         x, y, w, h = cv2.boundingRect(contours[i])
         parent_idx = int(hierarchy[i][3])
         is_master = parent_idx == -1
-        # Raíces: descartar demasiado pequeños o borde de imagen. Hijos (centros de a,e,o,d): no filtrar por tamaño
         if is_master:
-            if w < 2 or h < 2 or w > w_img * 0.99:
+            if w < 2 or h < 2:
+                continue
+            if w > w_img * 0.99 or h > h_img * 0.99:
+                area_ratio = (w * h) / (w_img * h_img) if (w_img * h_img) > 0 else 0
+                if area_ratio >= 0.5:
+                    full_image_candidates.append((i, x, y, w, h, contours[i], _children_from_hierarchy(hierarchy, i)))
                 continue
         else:
             if w > w_img * 0.99 or h > h_img * 0.99:
@@ -363,6 +368,21 @@ def _detect_shapes_smart_render(
             "childrenIds": children_ids,
             "contour_path_d": path_d,
         })
+    if not any(s.get("is_master") for s in shapes) and full_image_candidates:
+        i, x, y, w, h, cnt, children_ids = full_image_candidates[0]
+        path_d = _contour_to_svg_path_d(cnt, 1.0, 1.0)
+        shapes.append({
+            "id": i,
+            "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+            "norm_x": float(x / w_img), "norm_y": float(y / h_img),
+            "norm_w": float(w / w_img), "norm_h": float(h / h_img),
+            "color": "#ffffff",
+            "is_master": True,
+            "childrenIds": children_ids,
+            "contour_path_d": path_d,
+        })
+        if out_shapes is not None and i not in out_shapes:
+            out_shapes[i] = cnt.copy()
     return shapes
 
 
@@ -658,10 +678,11 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                 print(f"[ERROR DETECCIÓN SMART RENDER] preprocesar_imagen: {e}", flush=True)
                 raise HTTPException(status_code=500, detail=_error_body("DETECTION_ERROR", f"Error en detección (Smart Render): {e}"))
 
-        # Si no se detectó ninguna caja, añadir una “imagen completa” para que siempre aparezca al menos una caja de selección (ROLLO o 3D)
-        if not cajas:
+        # En ROLLO o sin cajas: asegurar al menos una caja de selección (imagen completa)
+        masters_in_cajas = [s for s in cajas if s.get("is_master")]
+        if not cajas or (modo_detectado == "ROLLO" and not masters_in_cajas):
             path_d_full = f"M 0 0 L {w_px} 0 L {w_px} {h_px} L 0 {h_px} Z"
-            cajas = [{
+            full_caja = {
                 "id": 0,
                 "x": 0, "y": 0, "w": w_px, "h": h_px,
                 "norm_x": 0.0, "norm_y": 0.0, "norm_w": 1.0, "norm_h": 1.0,
@@ -669,7 +690,11 @@ async def preprocesar_imagen(request: Request, file: UploadFile = File(...), x_j
                 "is_master": True,
                 "childrenIds": [],
                 "contour_path_d": path_d_full,
-            }]
+            }
+            if not cajas:
+                cajas = [full_caja]
+            else:
+                cajas = [full_caja] + [c for c in cajas if not c.get("is_master")]
 
         _job_store_set(job_id, job_shapes, job_meta, float(round(wm, 2)), float(round(hm, 2)), str(modo_detectado))
         return {

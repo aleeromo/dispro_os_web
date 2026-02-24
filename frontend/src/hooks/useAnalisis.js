@@ -92,7 +92,26 @@ export function useAnalisis({ modo, onAnalisisComplete, onArchivoDetectado, getP
         wM: parseFloat(res.data.ancho_m) || 1.0,
         hM: parseFloat(res.data.alto_m)  || 1.0,
       });
-      const newCajas = Array.isArray(res.data.cajas) ? res.data.cajas : [];
+      let newCajas = Array.isArray(res.data.cajas) ? res.data.cajas : [];
+      const wPx = res.data.ancho_px || 1;
+      const hPx = res.data.alto_px || 1;
+      if (newCajas.length === 0 && wPx > 0 && hPx > 0) {
+        newCajas = [{
+          id: 0,
+          x: 0,
+          y: 0,
+          w: wPx,
+          h: hPx,
+          norm_x: 0,
+          norm_y: 0,
+          norm_w: 1,
+          norm_h: 1,
+          color: '#ffffff',
+          is_master: true,
+          childrenIds: [],
+          contour_path_d: `M 0 0 L ${wPx} 0 L ${wPx} ${hPx} L 0 ${hPx} Z`,
+        }];
+      }
       setCajas(newCajas);
       setClassifications((prev) => {
         const next = { ...prev };
