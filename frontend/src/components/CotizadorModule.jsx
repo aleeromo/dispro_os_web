@@ -168,7 +168,7 @@ export function CotizadorModule({ isDarkMode, handleGenerarExpress }) {
           <div className="mb-10 select-none">
             <h1 className="text-[4rem] font-black tracking-tighter uppercase leading-none text-white drop-shadow-2xl">NUESTROS</h1>
             <h1 className="text-[5rem] font-normal lowercase leading-none text-cyan-400 -mt-3 drop-shadow-[0_0_15px_rgba(34,211,238,0.4)]"
-              style={{ fontFamily: "'Lobster', cursive" }}>
+              style={{ fontFamily: "'Brush Script MT', 'Brush Script Std', 'Style Script', cursive" }}>
               Servicios
             </h1>
           </div>
